@@ -18,6 +18,9 @@ var NumRedirects int
 var Srcip string
 var IgnoreLocalResolvers bool
 var MeasurementSeparation int
+var ProxyURL string
+var ProxyUser string
+var OutputDir string
 
 var WhoamiEndpoints = [...]string{
 	"o-o.myaddr.l.google.com",
@@ -44,5 +47,8 @@ func init() {
 	flag.IntVar(&NumRedirects, "num-redirects", 10, "Number of redirects to follow for an HTTP request (default 10)")
 	flag.StringVar(&Srcip, "src-ip", "", "Source IP address to use (will use default if unspecified)")
 	flag.BoolVar(&IgnoreLocalResolvers, "ignore-local-resolvers", false, "Does not add local resolvers in measurements when enabled (default - false)")
+	flag.StringVar(&ProxyURL, "proxy-url", "", "HTTP CONNECT proxy URL for TCP/TLS (e.g. http://brd.superproxy.io:33335)")
+	flag.StringVar(&ProxyUser, "proxy-user", "", "Proxy auth as user:pass (e.g. brd-customer-xxx-zone-yyy:password)")
+	flag.StringVar(&OutputDir, "output-dir", "", "Output directory for results (default: results/<timestamp>/)")
 	flag.Parse()
 }

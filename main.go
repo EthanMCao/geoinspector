@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/censoredplanet/geoinspector/config"
 	"github.com/censoredplanet/geoinspector/dns"
@@ -157,8 +159,33 @@ func ExtractDNSData(filename string, controlFilename string) {
 
 }
 
+func setupOutputDir() {
+	if config.OutputDir == "" {
+		timestamp := time.Now().Format("2006-01-02_15-04-05")
+		config.OutputDir = filepath.Join("results", timestamp)
+	}
+	log.Printf("[MAIN.setupOutputDir] Output directory: %s", config.OutputDir)
+
+	if err := os.MkdirAll(config.OutputDir, 0755); err != nil {
+		log.Fatal("[MAIN.setupOutputDir] Could not create output directory: ", err)
+	}
+
+	prependDir := func(path string, defaultBase string) string {
+		if path == "-" || path == "" {
+			return filepath.Join(config.OutputDir, defaultBase)
+		}
+		return filepath.Join(config.OutputDir, filepath.Base(path))
+	}
+
+	config.OutputDNSFile = prependDir(config.OutputDNSFile, "dns_output.json")
+	config.DNSParsedOutput = prependDir(config.DNSParsedOutput, "dns_parsed_output.csv")
+	config.OutputConnFile = prependDir(config.OutputConnFile, "tcp_output.json")
+	config.OutputFailedConnFile = prependDir(config.OutputFailedConnFile, "tcp_failed.csv")
+}
+
 func main() {
 	log.Println("[MAIN.main] Staring GeoInspector measurements")
+	setupOutputDir()
 	switch config.Module {
 	case "full":
 		DnsModule()

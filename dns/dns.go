@@ -2,7 +2,11 @@ package dns
 
 import (
 	"bufio"
+	"encoding/base64"
+	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -26,14 +30,15 @@ type ResponseEntry struct {
 }
 
 type QueryResponse struct {
-	ResolverIP      string           `json:"resolver"`
-	Domain          string           `json:"domain"`
-	StartTime       string           `json:"start_time"`
-	EndTime         string           `json:"end_time"`
-	Responses       []ResponseResult `json:"responses"`
-	TraceResults    []*TraceResult   `json:"trace"`
-	AuthoritativeNs string           `json:"authoritative_ns"`
-	Error           string           `json:"error"`
+	ResolverIP        string           `json:"resolver"`
+	Domain            string           `json:"domain"`
+	StartTime         string           `json:"start_time"`
+	EndTime           string           `json:"end_time"`
+	Responses         []ResponseResult `json:"responses"`
+	TraceResults      []*TraceResult   `json:"trace"`
+	AuthoritativeNs   string           `json:"authoritative_ns"`
+	Error             string           `json:"error"`
+	DNSViaProxy       bool             `json:"dns_via_proxy,omitempty"` // true when DNS was sent through proxy
 }
 
 type InputDNSResolver struct {
@@ -139,8 +144,100 @@ func ParseDNS(resp *dns.Msg, err error, domain string) *ResponseResult {
 	return parsed
 }
 
-// Worker to send DNS queries to target IP
+// dialDNSThroughProxy dials a DNS resolver through an HTTP CONNECT proxy
+func dialDNSThroughProxy(resolverIP string, proxyURL *url.URL, proxyUser string) (net.Conn, error) {
+	// Connect to proxy
+	proxyAddr := proxyURL.Host
+	if proxyURL.Port() == "" {
+		if proxyURL.Scheme == "https" {
+			proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "443")
+		} else {
+			proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "80")
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := dialer.Dial("tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dial failed: %w", err)
+	}
+
+	// Send CONNECT request to tunnel to resolver:53
+	target := net.JoinHostPort(resolverIP, "53")
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+
+	// Add proxy auth if provided
+	if proxyUser != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(proxyUser))
+		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
+	} else if proxyURL.User != nil {
+		if password, ok := proxyURL.User.Password(); ok {
+			userPass := proxyURL.User.Username() + ":" + password
+			auth := base64.StdEncoding.EncodeToString([]byte(userPass))
+			connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
+		} else {
+			auth := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username()))
+			connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
+		}
+	}
+
+	connectReq += "\r\n"
+
+	// Send CONNECT
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT write failed: %w", err)
+	}
+
+	// Read response
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT read failed: %w", err)
+	}
+
+	if !strings.Contains(statusLine, "200") {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(statusLine))
+	}
+
+	// Consume remaining headers until blank line
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("proxy header read failed: %w", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Return a connection that uses the buffered reader for any leftover data
+	return &connWithBufferedReader{Conn: conn, reader: reader}, nil
+}
+
+// connWithBufferedReader wraps a net.Conn to handle buffered data from proxy response
+type connWithBufferedReader struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *connWithBufferedReader) Read(b []byte) (int, error) {
+	if c.reader.Buffered() > 0 {
+		return c.reader.Read(b)
+	}
+	return c.Conn.Read(b)
+}
+
+// Worker to send DNS queries to target IP (TCP through proxy if configured)
 func QueryWorker(client *dns.Client, resolver InputDNSResolver, domains <-chan string, results chan<- *QueryResponse) {
+	// When proxy is configured, skip DNS-via-proxy (port 53 blocked by Bright Data)
+	// DNS will be handled by proxy's -dns-remote during TCP connections
+	useDNSViaProxy := false
+	var proxyURL *url.URL
+
 	// Loop jobs channel until it is closed
 	for testDomain := range domains {
 		// Initialize default value assignment
@@ -150,10 +247,9 @@ func QueryWorker(client *dns.Client, resolver InputDNSResolver, domains <-chan s
 			Responses:  make([]ResponseResult, 0),
 			Error:      "",
 		}
-		// Iteratively get authoritative nameserver
 		reply.StartTime = time.Now().Round(0).String()
 
-		//If recurive, perform trace, else perform normal query
+		//If recursive, perform trace (always uses raw DNS, no proxy)
 		if resolver.IP == "recursive" {
 			for i := 0; i < 3; i++ {
 				reply.TraceResults, reply.AuthoritativeNs = recursiveTrace(testDomain)
@@ -163,12 +259,10 @@ func QueryWorker(client *dns.Client, resolver InputDNSResolver, domains <-chan s
 				time.Sleep(time.Duration(config.MeasurementSeparation) * time.Second)
 			}
 			if reply.AuthoritativeNs != "" {
-				// Start trials for test domain
 				msg := new(dns.Msg)
 				msg.SetQuestion(dns.Fqdn(testDomain), dns.TypeA)
-				// Trial 3 times
 				for i := 0; i < 3; i++ {
-					resp, _, err := client.Exchange(msg, reply.AuthoritativeNs+":53")
+					resp, _, err := client.Exchange(msg, net.JoinHostPort(reply.AuthoritativeNs, "53"))
 					parsed := ParseDNS(resp, err, testDomain)
 					reply.Responses = append(reply.Responses, *parsed)
 					reply.Error = parsed.Err
@@ -180,12 +274,63 @@ func QueryWorker(client *dns.Client, resolver InputDNSResolver, domains <-chan s
 			} else {
 				reply.Error = "Iterative error"
 			}
-		} else {
+		} else if useDNSViaProxy {
+			// Use DNS over TCP through proxy (geo-representative DNS from proxy exit)
+			reply.DNSViaProxy = true
 			msg := new(dns.Msg)
 			msg.SetQuestion(dns.Fqdn(testDomain), dns.TypeA)
-			// Trial 3 times
+			
 			for i := 0; i < 3; i++ {
-				resp, _, err := client.Exchange(msg, resolver.IP+":53")
+				// Dial to resolver through proxy
+				conn, err := dialDNSThroughProxy(resolver.IP, proxyURL, config.ProxyUser)
+				if err != nil {
+					parsed := &ResponseResult{
+						Response: []ResponseEntry{},
+						Err:      fmt.Sprintf("proxy dial error: %v", err),
+						Rcode:    -1,
+						RawMsg:   nil,
+					}
+					reply.Responses = append(reply.Responses, *parsed)
+					reply.Error = parsed.Err
+					time.Sleep(time.Duration(config.MeasurementSeparation) * time.Second)
+					continue
+				}
+
+				// Create DNS connection and query
+				dnsConn := &dns.Conn{Conn: conn}
+				if err := dnsConn.WriteMsg(msg); err != nil {
+					dnsConn.Close()
+					parsed := &ResponseResult{
+						Response: []ResponseEntry{},
+						Err:      fmt.Sprintf("DNS write error: %v", err),
+						Rcode:    -1,
+						RawMsg:   nil,
+					}
+					reply.Responses = append(reply.Responses, *parsed)
+					reply.Error = parsed.Err
+					time.Sleep(time.Duration(config.MeasurementSeparation) * time.Second)
+					continue
+				}
+
+				dnsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				resp, err := dnsConn.ReadMsg()
+				dnsConn.Close()
+
+				parsed := ParseDNS(resp, err, testDomain)
+				reply.Responses = append(reply.Responses, *parsed)
+				reply.Error = parsed.Err
+				if parsed.Err == "null" {
+					break
+				}
+				time.Sleep(time.Duration(config.MeasurementSeparation) * time.Second)
+			}
+		} else {
+			// Standard raw DNS query (UDP/TCP, not through proxy)
+			resolverAddr := net.JoinHostPort(resolver.IP, "53")
+			msg := new(dns.Msg)
+			msg.SetQuestion(dns.Fqdn(testDomain), dns.TypeA)
+			for i := 0; i < 3; i++ {
+				resp, _, err := client.Exchange(msg, resolverAddr)
 				parsed := ParseDNS(resp, err, testDomain)
 				reply.Responses = append(reply.Responses, *parsed)
 				reply.Error = parsed.Err
@@ -267,7 +412,7 @@ func recursiveTrace(targetDomain string) ([]*TraceResult, string) {
 			}
 			// Try to query up to three times
 			for i := 0; i < 3; i++ {
-				r, _, err = client.Exchange(q, target+":53")
+				r, _, err = client.Exchange(q, net.JoinHostPort(target, "53"))
 				if err == nil {
 					break
 				}
@@ -335,7 +480,7 @@ func whoamiResolver(resolver *InputDNSResolver) {
 		client := new(dns.Client)
 
 		for i := 0; i < 3; i++ {
-			resp, _, err := client.Exchange(msg, resolver.IP+":53")
+			resp, _, err := client.Exchange(msg, net.JoinHostPort(resolver.IP, "53"))
 			parsed := ParseDNS(resp, err, whoamiEndpoint)
 			resolver.WhoamiResp = append(resolver.WhoamiResp, *parsed)
 			// Only conduct the second liveness test if connection error
@@ -374,9 +519,14 @@ func DNS(inputDNSResolvers []*InputDNSResolver, inputURLs []*util.InputURL) {
 	}
 	close(jobs)
 
-	for i := 1; i <= len(inputDNSResolvers)*len(inputURLs); i++ {
+	totalQueries := len(inputDNSResolvers) * len(inputURLs)
+	log.Printf("[DNS.dns] Total DNS queries: %d (resolvers: %d, domains: %d)", totalQueries, len(inputDNSResolvers), len(inputURLs))
+	for i := 1; i <= totalQueries; i++ {
 		result := <-results
 		util.SaveResults(result, outputFile)
+		if i%100 == 0 || i == totalQueries {
+			log.Printf("[DNS.dns] Progress: %d/%d queries completed (%.1f%%)", i, totalQueries, float64(i)/float64(totalQueries)*100)
+		}
 	}
 
 	log.Println("[DNS.dns] Performing recursive DNS traces")
@@ -399,8 +549,13 @@ func DNS(inputDNSResolvers []*InputDNSResolver, inputURLs []*util.InputURL) {
 	}
 	close(recursiveJobs)
 	// Send results to the main goroutine
-	for i := 0; i < len(inputURLs); i++ {
+	totalRecursive := len(inputURLs)
+	log.Printf("[DNS.dns] Recursive trace queries: %d domains", totalRecursive)
+	for i := 0; i < totalRecursive; i++ {
 		result := <-results
 		util.SaveResults(result, outputFile)
+		if (i+1)%50 == 0 || (i+1) == totalRecursive {
+			log.Printf("[DNS.dns] Recursive progress: %d/%d completed (%.1f%%)", i+1, totalRecursive, float64(i+1)/float64(totalRecursive)*100)
+		}
 	}
 }

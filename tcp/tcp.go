@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -199,56 +201,158 @@ func SendHTTPRequestWithRedirects(host string, domain string, numRedirects int) 
 	return resp
 }
 
+// dialThroughProxy connects to targetHost via HTTP CONNECT proxy.
+// Returns a raw TCP connection to the target (ready for TLS handshake).
+func dialThroughProxy(targetHost string, proxyURL *url.URL, proxyUser string) (net.Conn, error) {
+	proxyAddr := proxyURL.Host
+	if proxyURL.Port() == "" {
+		proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "80")
+	}
+
+	var dialer *net.Dialer
+	if config.Srcip != "" {
+		dialer = &net.Dialer{
+			LocalAddr: &net.TCPAddr{IP: net.ParseIP(config.Srcip), Port: 0},
+			Timeout:   10 * time.Second,
+		}
+	} else {
+		dialer = &net.Dialer{Timeout: 10 * time.Second}
+	}
+
+	proxyConn, err := dialer.Dial("tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("proxy connect: %w", err)
+	}
+
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetHost, targetHost)
+	if proxyUser != "" {
+		req += "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(proxyUser)) + "\r\n"
+	} else if proxyURL.User != nil {
+		pass, _ := proxyURL.User.Password()
+		auth := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + pass))
+		req += "Proxy-Authorization: Basic " + auth + "\r\n"
+	}
+	req += "\r\n"
+
+	if _, err := proxyConn.Write([]byte(req)); err != nil {
+		proxyConn.Close()
+		return nil, fmt.Errorf("proxy CONNECT write: %w", err)
+	}
+
+	br := bufio.NewReader(proxyConn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		proxyConn.Close()
+		return nil, fmt.Errorf("proxy response read: %w", err)
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/") {
+		proxyConn.Close()
+		return nil, fmt.Errorf("invalid proxy response: %s", strings.TrimSpace(statusLine))
+	}
+	statusParts := strings.SplitN(statusLine, " ", 3)
+	if len(statusParts) < 2 {
+		proxyConn.Close()
+		return nil, fmt.Errorf("invalid proxy response: %s", strings.TrimSpace(statusLine))
+	}
+	if statusParts[1] != "200" {
+		proxyConn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(statusLine))
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil || line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	return &connWithBufferedReader{Conn: proxyConn, br: br}, nil
+}
+
+// connWithBufferedReader wraps a net.Conn so reads first drain buffered data.
+type connWithBufferedReader struct {
+	net.Conn
+	br *bufio.Reader
+}
+
+func (c *connWithBufferedReader) Read(p []byte) (n int, err error) {
+	if c.br.Buffered() > 0 {
+		return c.br.Read(p)
+	}
+	return c.Conn.Read(p)
+}
+
 // InitConn initiates a TLS connection to the host with the SNI field set to domain.
 // Returns the parsed data from the TLS connection and the (open) connection object.
 func InitConn(host string, domain string) (*HTTPSData, *tls.Conn, error) {
 	var conn *tls.Conn
 	var err error
 	var data *HTTPSData
-	var dialer *net.Dialer
-	if config.Srcip != "" {
-		dialer = &net.Dialer{
-			LocalAddr: &net.TCPAddr{
-				IP:   net.ParseIP(config.Srcip),
-				Port: 0,
-			},
-			Timeout: 3 * time.Second,
-		}
-	} else {
-		dialer = &net.Dialer{
-			Timeout: 3 * time.Second,
-		}
-	}
 
+	conf := &tls.Config{InsecureSkipVerify: true}
+	if domain != "" {
+		conf.ServerName = domain
+	}
 	if domain == "" {
 		data = &HTTPSData{
 			IsDomainIncluded: false,
 			StartTime:        time.Now().Round(0).String(),
 			Redirects:        []string{},
 		}
-		conf := &tls.Config{
-			InsecureSkipVerify: true,
-		}
-		conn, err = tls.DialWithDialer(dialer, "tcp", host, conf)
 	} else {
 		data = &HTTPSData{
 			IsDomainIncluded: true,
 			StartTime:        time.Now().Round(0).String(),
 			Redirects:        []string{},
 		}
-		conf := &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         domain,
+	}
+
+	var rawConn net.Conn
+	if config.ProxyURL != "" {
+		proxyURL, parseErr := url.Parse(config.ProxyURL)
+		if parseErr != nil {
+			data.Error = "Proxy URL parse error: " + parseErr.Error()
+			return data, nil, parseErr
 		}
-		conn, err = tls.DialWithDialer(dialer, "tcp", host, conf)
-	}
-	if err != nil {
-		data.Error = "TLS Error: " + err.Error()
+		rawConn, err = dialThroughProxy(host, proxyURL, config.ProxyUser)
+		if err != nil {
+			data.Error = "TLS Error: " + err.Error()
+			return data, nil, err
+		}
+		defer func() {
+			if err != nil && rawConn != nil {
+				rawConn.Close()
+			}
+		}()
 	} else {
-		state := conn.ConnectionState()
-		data = extractTLSData(data, state)
+		var dialer *net.Dialer
+		if config.Srcip != "" {
+			dialer = &net.Dialer{
+				LocalAddr: &net.TCPAddr{IP: net.ParseIP(config.Srcip), Port: 0},
+				Timeout:   3 * time.Second,
+			}
+		} else {
+			dialer = &net.Dialer{Timeout: 3 * time.Second}
+		}
+		rawConn, err = dialer.Dial("tcp", host)
+		if err != nil {
+			data.Error = "TLS Error: " + err.Error()
+			return data, nil, err
+		}
+		defer func() {
+			if err != nil && rawConn != nil {
+				rawConn.Close()
+			}
+		}()
 	}
-	return data, conn, err
+
+	conn = tls.Client(rawConn, conf)
+	if err = conn.Handshake(); err != nil {
+		data.Error = "TLS Error: " + err.Error()
+		return data, nil, err
+	}
+
+	state := conn.ConnectionState()
+	data = extractTLSData(data, state)
+	return data, conn, nil
 }
 
 func RequestWorker(jobs <-chan InputServer, results chan<- *Response, numRedirects int) {
@@ -321,9 +425,14 @@ func ConnSendRecv(InputServers []*InputServer, port uint, numRedirects int) {
 	}
 
 	failed := make(map[string]struct{})
-	for i := 1; i <= len(InputServers); i++ {
+	totalEndpoints := len(InputServers)
+	log.Printf("[TCP.ConnSendRecv] Total endpoints to test: %d", totalEndpoints)
+	for i := 1; i <= totalEndpoints; i++ {
 		result := <-results
 		util.SaveResults(result, outputFile)
+		if i%50 == 0 || i == totalEndpoints {
+			log.Printf("[TCP.ConnSendRecv] Progress: %d/%d endpoints completed (%.1f%%)", i, totalEndpoints, float64(i)/float64(totalEndpoints)*100)
+		}
 		key := fmt.Sprintf("%s,%s,", result.Endpoint.Ip, result.Endpoint.Domain)
 		// If the handshake is not completed and this is a new domain+ip, save.
 		if _, ok := failed[key]; !ok {

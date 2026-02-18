@@ -29,13 +29,22 @@ The following flags can be provided for running measurements:
 | num-query-workers            | 3                        | Number of qeuries to perform to each resolver at any moment                   |                                            |
 | num-redirects                   | 10                        | Number of redirects to follow for an HTTP request                |                                            |
 | src-ip             |                       | Source IP address to use (will use default if unspecified) |                                            |
+| proxy-url             |                       | HTTP CONNECT proxy for TCP/TLS (e.g. http://proxy.example.com:8080) |                                            |
+| proxy-user             |                       | Proxy auth as user:pass |                                            |
+| output-dir             | results/\<timestamp\>/                       | Output directory for all result files (auto-creates timestamped folder if not specified) |                                            |
 | ignore-local-resolvers             | False                    | Does not add local resolvers in measurements when enabled                           |                                            |                                      |
+
+### DNS and proxy
+
+When `--proxy-url` is set, **all measurements (DNS, TCP, TLS, HTTP) go through the proxy**. DNS queries use **DNS-over-TCP** tunneled through the proxy using HTTP CONNECT to your configured resolvers. This ensures DNS resolution happens from the proxy exit location (geo-representative DNS). Each DNS result in `dns_output.json` includes `"dns_via_proxy": true` to confirm the query was routed through the proxy.
 
 ## Usage
 Run `GeoInspector` with a command like:
 ```
 sudo ./geoinspector --input-url-file examples/test.csv --asn-mmdb GeoLite2-ASN.mmdb --output-dns-file examples/dns_output.json --output-parsed-dns examples/dns_parsed_output.csv --output-conn-file examples/tcp_output.json --output-failed-conn-file examples/tcp_failed.json  --num-workers 1 --num-query-workers 1 --input-resolver-file examples/dns-resolvers.csv
 ```
+
+By default, all outputs are saved in a timestamped directory like `results/2026-02-05_18-43-31/`. Use `--output-dir <path>` to specify a custom directory (e.g. `--output-dir results/us_test_1`).
 
 ## Disclaimer
 `GeoInspector` performs multiple measurements towards endpoints with domains in the payload. Please exercise caution when using `GeoInspector` to not place you or others at risk of service disruptions, and do not request illegal content. Please refer to [our paper](https://censoredplanet.org/publicaitons/russia-ukraine-invasion.pdf) for more information.
