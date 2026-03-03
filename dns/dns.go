@@ -38,7 +38,8 @@ type QueryResponse struct {
 	TraceResults      []*TraceResult   `json:"trace"`
 	AuthoritativeNs   string           `json:"authoritative_ns"`
 	Error             string           `json:"error"`
-	DNSViaProxy       bool             `json:"dns_via_proxy,omitempty"` // true when DNS was sent through proxy
+	// Edited to work with proxy: true when DNS was sent through proxy.
+	DNSViaProxy       bool             `json:"dns_via_proxy,omitempty"`
 }
 
 type InputDNSResolver struct {
@@ -144,6 +145,7 @@ func ParseDNS(resp *dns.Msg, err error, domain string) *ResponseResult {
 	return parsed
 }
 
+// Edited to work with proxy: DNS-over-TCP tunnel via HTTP CONNECT (currently disabled—port 53 blocked by Bright Data).
 // dialDNSThroughProxy dials a DNS resolver through an HTTP CONNECT proxy
 func dialDNSThroughProxy(resolverIP string, proxyURL *url.URL, proxyUser string) (net.Conn, error) {
 	// Connect to proxy
@@ -218,6 +220,7 @@ func dialDNSThroughProxy(resolverIP string, proxyURL *url.URL, proxyUser string)
 	return &connWithBufferedReader{Conn: conn, reader: reader}, nil
 }
 
+// Edited to work with proxy: wrapper for reading after CONNECT response.
 // connWithBufferedReader wraps a net.Conn to handle buffered data from proxy response
 type connWithBufferedReader struct {
 	net.Conn
@@ -231,6 +234,7 @@ func (c *connWithBufferedReader) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// Edited to work with proxy: optional DNS path via proxy (useDNSViaProxy=false when port 53 blocked).
 // Worker to send DNS queries to target IP (TCP through proxy if configured)
 func QueryWorker(client *dns.Client, resolver InputDNSResolver, domains <-chan string, results chan<- *QueryResponse) {
 	// When proxy is configured, skip DNS-via-proxy (port 53 blocked by Bright Data)

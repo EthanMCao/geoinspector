@@ -159,6 +159,7 @@ func ExtractDNSData(filename string, controlFilename string) {
 
 }
 
+// Edited to work with proxy: auto-create timestamped or custom output dir so per-region results don't overwrite.
 func setupOutputDir() {
 	if config.OutputDir == "" {
 		timestamp := time.Now().Format("2006-01-02_15-04-05")
@@ -185,6 +186,7 @@ func setupOutputDir() {
 
 func main() {
 	log.Println("[MAIN.main] Staring GeoInspector measurements")
+	// Edited to work with proxy: set up output directory before running modules.
 	setupOutputDir()
 	switch config.Module {
 	case "full":

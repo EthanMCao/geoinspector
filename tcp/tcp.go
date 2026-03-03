@@ -201,6 +201,7 @@ func SendHTTPRequestWithRedirects(host string, domain string, numRedirects int) 
 	return resp
 }
 
+// Ethan:Edited to work with proxy (HTTP CONNECT tunnel for geo-targeted measurements).
 // dialThroughProxy connects to targetHost via HTTP CONNECT proxy.
 // Returns a raw TCP connection to the target (ready for TLS handshake).
 func dialThroughProxy(targetHost string, proxyURL *url.URL, proxyUser string) (net.Conn, error) {
@@ -306,6 +307,7 @@ func InitConn(host string, domain string) (*HTTPSData, *tls.Conn, error) {
 	}
 
 	var rawConn net.Conn
+	//Ethan: Edited to work with proxy: when --proxy-url is set, tunnel via proxy instead of direct dial.
 	if config.ProxyURL != "" {
 		proxyURL, parseErr := url.Parse(config.ProxyURL)
 		if parseErr != nil {
